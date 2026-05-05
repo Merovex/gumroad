@@ -133,6 +133,7 @@ class StripePayoutProcessor
   #   * Setting the amount_cents.
   # Returns an array of errors.
   def self.prepare_payment_and_set_amount(payment, balances)
+    failed = false
     merchant_account, balances_held_by_gumroad, balances_held_by_stripe = get_payout_details(payment.user, balances)
 
     if merchant_account.nil?
@@ -194,17 +195,21 @@ class StripePayoutProcessor
     []
   rescue Stripe::InvalidRequestError => e
     failed = true
+    payment.error_message = e.message.to_s.truncate(1000)
     ErrorNotifier.notify(e)
     [e.message]
-  rescue Stripe::AuthenticationError, Stripe::APIConnectionError
+  rescue Stripe::AuthenticationError, Stripe::APIConnectionError => e
     failed = true
+    payment.error_message = "#{e.class.name}: #{e.message}".truncate(1000)
     raise
   rescue Stripe::StripeError => e
     failed = true
+    payment.error_message = e.message.to_s.truncate(1000)
     ErrorNotifier.notify(e)
     [e.message]
-  rescue RuntimeError
+  rescue RuntimeError => e
     failed = true
+    payment.error_message = "#{e.class.name}: #{e.message}".truncate(1000)
     raise
   ensure
     payment.mark_failed! if failed
@@ -225,6 +230,8 @@ class StripePayoutProcessor
   # Public: Actually sends the money.
   # Returns an array of errors.
   def self.perform_payment(payment)
+    failed = false
+    failure_reason = nil
     # We have transferred the balance held by gumroad to the connected Stripe standard account.
     # No payout needs to be issued in this case.
     merchant_account = payment.user.merchant_accounts.find_by(charge_processor_merchant_id: payment.stripe_connect_account_id)
@@ -268,22 +275,18 @@ class StripePayoutProcessor
     []
   rescue Stripe::InvalidRequestError => e
     failed = true
-    if e.message["Cannot create live transfers"] || e.message["Cannot create payouts"]
-      failure_reason = Payment::FailureReason::CANNOT_PAY
-    elsif e.message["Debit card transfers are only supported for amounts less"]
-      failure_reason = Payment::FailureReason::DEBIT_CARD_LIMIT
-    elsif e.message["Insufficient funds in Stripe account"]
-      failure_reason = Payment::FailureReason::INSUFFICIENT_FUNDS
-    else
-      ErrorNotifier.notify(e)
-    end
+    failure_reason = stripe_invalid_request_error_failure_reason(e)
+    ErrorNotifier.notify(e) if failure_reason.nil?
+    payment.error_message = e.message.to_s.truncate(1000)
     Rails.logger.info("Payouts: Payout errors for user with id: #{payment.user_id} #{e.message}")
     [e.message]
-  rescue Stripe::AuthenticationError, Stripe::APIConnectionError
+  rescue Stripe::AuthenticationError, Stripe::APIConnectionError => e
     failed = true
+    payment.error_message = "#{e.class.name}: #{e.message}".truncate(1000)
     raise
   rescue Stripe::StripeError => e
     failed = true
+    payment.error_message = e.message.to_s.truncate(1000)
     ErrorNotifier.notify(e)
     Rails.logger.info("Payouts: Payout errors for user with id: #{payment.user_id} #{e.message}")
     [e.message]
@@ -291,9 +294,26 @@ class StripePayoutProcessor
     Rails.logger.info("Payouts: Payout of #{payment.amount_cents} attempted for user with id: #{payment.user_id}")
     if failed
       payment.mark_failed!(failure_reason)
+      # Mark the bank account deleted before the reversal so a transient Stripe error
+      # in `reverse_internal_transfer!` cannot leave a dead bank reference alive for the next nightly run.
+      payment.bank_account&.mark_deleted! if failure_reason == Payment::FailureReason::BANK_ACCOUNT_NOT_FOUND_AT_STRIPE
       reverse_internal_transfer!(payment)
     end
   end
+
+  def self.stripe_invalid_request_error_failure_reason(error)
+    case error.message.to_s
+    when /Cannot create live transfers/, /Cannot create payouts/
+      Payment::FailureReason::CANNOT_PAY
+    when /Debit card transfers are only supported for amounts less/
+      Payment::FailureReason::DEBIT_CARD_LIMIT
+    when /Insufficient funds in Stripe account/
+      Payment::FailureReason::INSUFFICIENT_FUNDS
+    when /has been deleted and can no longer be used/
+      Payment::FailureReason::BANK_ACCOUNT_NOT_FOUND_AT_STRIPE
+    end
+  end
+  private_class_method :stripe_invalid_request_error_failure_reason
 
   def self.handle_stripe_event(stripe_event, stripe_connect_account_id:)
     stripe_event_id = stripe_event["id"]

@@ -3613,4 +3613,113 @@ describe StripePayoutProcessor, :vcr do
       end
     end
   end
+
+  describe ".perform_payment Stripe error handling" do
+    let(:user) { create(:user) }
+    let(:bank_account) { create(:ach_account, user:, stripe_connect_account_id: "acct_test_xxx", stripe_bank_account_id: "ba_test_xxx") }
+    let!(:merchant_account) do
+      create(:merchant_account, user:, charge_processor_merchant_id: "acct_test_xxx", currency: "usd")
+    end
+    let(:payment) do
+      create(:payment,
+             user:, bank_account:, processor: PayoutProcessorType::STRIPE,
+             state: "processing", amount_cents: 1_000,
+             stripe_connect_account_id: merchant_account.charge_processor_merchant_id,
+             currency: "usd",
+             payout_period_end_date: Date.current - 1,
+             correlation_id: nil,
+             payout_type: Payouts::PAYOUT_TYPE_STANDARD)
+    end
+
+    context "when Stripe rejects the payout because the destination bank account has been deleted" do
+      let(:stripe_error_message) do
+        "The bank account ba_test_xxx has been deleted and can no longer be used."
+      end
+
+      before do
+        allow(Stripe::Payout).to receive(:create).and_raise(Stripe::InvalidRequestError.new(stripe_error_message, "destination"))
+      end
+
+      it "marks the payment with failure_reason BANK_ACCOUNT_NOT_FOUND_AT_STRIPE" do
+        described_class.perform_payment(payment)
+        expect(payment.reload.failure_reason).to eq(Payment::FailureReason::BANK_ACCOUNT_NOT_FOUND_AT_STRIPE)
+      end
+
+      it "marks the bank account deleted so subsequent runs skip until the seller re-adds it" do
+        expect { described_class.perform_payment(payment) }
+          .to change { bank_account.reload.deleted_at }.from(nil)
+      end
+
+      it "stores the Stripe error message on the payment" do
+        described_class.perform_payment(payment)
+        expect(payment.reload.error_message).to eq(stripe_error_message)
+      end
+
+      it "does not notify the error tracker" do
+        expect(ErrorNotifier).not_to receive(:notify)
+        described_class.perform_payment(payment)
+      end
+
+      it "adds a payout note directing the seller to re-add their bank account" do
+        expect { described_class.perform_payment(payment) }
+          .to change { user.comments.with_type_payout_note.count }.by(1)
+        expect(user.comments.with_type_payout_note.last.content).to include("Re-add the bank account in payout settings")
+      end
+
+      context "and the internal transfer reversal raises a transient Stripe error afterwards" do
+        before do
+          payment.update!(stripe_internal_transfer_id: "tr_test_xxx")
+          allow(Stripe::Transfer).to receive(:retrieve).and_raise(Stripe::APIConnectionError.new("connection refused"))
+        end
+
+        it "still marks the bank account deleted before the reversal runs" do
+          expect { described_class.perform_payment(payment) }.to raise_error(Stripe::APIConnectionError)
+          expect(bank_account.reload.deleted_at).to be_present
+        end
+      end
+    end
+
+    context "when Stripe raises an unmatched Stripe::InvalidRequestError" do
+      before do
+        allow(Stripe::Payout).to receive(:create).and_raise(Stripe::InvalidRequestError.new("Something unexpected.", "param"))
+      end
+
+      it "captures the error message on the payment" do
+        described_class.perform_payment(payment)
+        expect(payment.reload.error_message).to eq("Something unexpected.")
+      end
+
+      it "leaves failure_reason nil so the existing flow is unchanged" do
+        described_class.perform_payment(payment)
+        expect(payment.reload.failure_reason).to be_nil
+      end
+
+      it "still notifies the error tracker for unmatched errors" do
+        expect(ErrorNotifier).to receive(:notify)
+        described_class.perform_payment(payment)
+      end
+    end
+
+    context "when Stripe raises a generic Stripe::StripeError" do
+      before do
+        allow(Stripe::Payout).to receive(:create).and_raise(Stripe::StripeError.new("Generic Stripe error."))
+      end
+
+      it "captures the error message on the payment" do
+        described_class.perform_payment(payment)
+        expect(payment.reload.error_message).to eq("Generic Stripe error.")
+      end
+    end
+
+    context "when Stripe raises Stripe::APIConnectionError" do
+      before do
+        allow(Stripe::Payout).to receive(:create).and_raise(Stripe::APIConnectionError.new("connection refused"))
+      end
+
+      it "re-raises the error and stores the class and message on the payment" do
+        expect { described_class.perform_payment(payment) }.to raise_error(Stripe::APIConnectionError)
+        expect(payment.reload.error_message).to eq("Stripe::APIConnectionError: connection refused")
+      end
+    end
+  end
 end
